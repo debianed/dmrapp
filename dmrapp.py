@@ -93,6 +93,7 @@ class DMRApp():
         # Заполняем поля
         self._users = users
         self._recdir = recdir
+        self._role = "user"
 
         # Подключаемся к БД
         self._pgsql = create_engine(pgconnstr, pool_pre_ping=True).connect()
@@ -148,7 +149,7 @@ class DMRApp():
                     M269.728,426.917l48.99-36.136l26.976,92.17L269.728,426.917z"/>
             </svg>
         '''
-        ui.run(port=2606, title='Радиосвязь DMR', favicon=radio, language='ru', storage_secret='###', reload=False, show=False)
+        ui.run(port=2606, title='Радиосвязь DMR', favicon=radio, language='ru', storage_secret='secret', reload=False, show=False)
 
     # Остановка приложения
     def stop(self) -> None:
@@ -157,8 +158,22 @@ class DMRApp():
     # Статистика по радиосвязи
     def getstat(self, year: int, month: int) -> pandas.DataFrame:
         data = self._db_mysql_get_stat(year, month)
+        data.insert(1, 'gid', data['senderid'])
+        data['gid'] = data['gid'].map(self._db_pgsql_get_groups())
         data['sender'] = data['sender'].map(self._db_pgsql_get_users())
-        data = data.rename(columns={'senderid': 'ID радиостанции', 'sender': 'Должность', 'sum': 'Общее время', 'len': 'Количество сеансов', 'avg': 'Среднее время'})
+        data = data.rename(columns={'senderid': 'ID радиостанции', 'gid': 'Группа', 'sender': 'Должность', 'sum': 'Общее время', 'len': 'Количество сеансов', 'avg': 'Среднее время'})
+        data = self._filter_recs(data)
+        return data
+
+    def getdetail(self, rid: int, year: int, month: int) -> pandas.DataFrame:
+        data = self._db_mysql_get_detail(rid, year, month)
+        data.insert(1, 'gid', data['senderid'])
+        data['gid'] = data['gid'].map(self._db_pgsql_get_groups())
+        data['sender'] = data['sender'].map(self._db_pgsql_get_users())
+        data['duration'] = data['duration'].div(1000).round(2)
+        data.insert(0, 'id', data.index + 1)
+        data = data.rename(columns={'id': '#', 'senderid': 'ID радиостанции', 'gid': 'Группа', 'sender': 'Должность', 'starttime': 'Начат', 'duration': 'Длительность (c)', 'endtime': 'Завершен'})
+        data = self._filter_recs(data)
         return data
 
     # Информация по звукозаписи
@@ -169,6 +184,27 @@ class DMRApp():
     #endregion
 
     #region Вспомогательные методы
+
+    def _filter_recs(self, recs: pandas.DataFrame,) -> pandas.DataFrame:
+        res = recs
+        match self._role:
+            case "manager":
+                res = res[res['Группа'] != 'Связисты']
+            case "user":
+                res = res[res['Группа'] != 'Связисты']
+                res = res[res['Группа'] != 'Административная']
+        return res
+
+    def _filter_groups(self, grps: list) -> list:
+        res = grps
+        match self._role:
+            case "manager":
+                res.remove('Связисты')
+            case "user":
+                res.remove('Связисты')
+                res.remove('Административная')
+        return res
+
     def _repeater(self, interval, function):
         Timer(interval, self._repeater, [interval, function]).start()
         function()
@@ -235,7 +271,8 @@ class DMRApp():
 
     # День, позднеее которого нельзя выбрать дату в календаре
     def _maxday(self) -> str:
-        gmt = self._u2g(datetime.datetime.now())
+        #gmt = self._u2g(datetime.datetime.now())
+        gmt = datetime.datetime.now()
         return gmt.strftime('%Y/%m/%d')
 
     # Устанавливает источник воспроизведения
@@ -266,6 +303,14 @@ class DMRApp():
         users_dict = {int(e['abonentid']):e['name'] for e in users if e['abonentid'].isdigit() }
         return users_dict
 
+    # Получает список радиостанций с их группами
+    def _db_pgsql_get_groups(self) -> dict:
+        self._db_check_connection(self._pgsql)
+        groups = self._pgsql.execute(text('select abonents.abonentid, groups.groupname from abonent_group, abonents, groups where abonent_group.ab_id = abonents.ab_id and abonent_group.group_id = groups.groupid;'))
+        groups = pandas.DataFrame(groups).to_dict(orient='records')
+        groups_dict = {int(e['abonentid']):e['groupname'] for e in groups if e['abonentid'].isdigit() }
+        return groups_dict
+
     # Возвращает список записей на определенную дату
     def _db_pgsql_get_records(self, dt: str) -> pandas.DataFrame:
         self._db_check_connection(self._pgsql)
@@ -291,6 +336,15 @@ class DMRApp():
         data = self._pgsql.execute(text(f'select filepath from sessions where id = \'{str(id)}\';'))
         data = data.fetchone()
         return data[0]
+
+    # Возвращает список имен радиогрупп
+    def _db_pgsql_get_group_names(self) -> list:
+        self._db_check_connection(self._pgsql)
+        data = self._pgsql.execute(text(f'select groupname from groups;'))
+        data = list(*zip(*data.fetchall()))
+        data.sort()
+        data.append('Все группы')
+        return data
 
     # Функция возвращает список лет, информация за которые имеется в БД
     def _db_mysql_get_years(self) -> list:
@@ -346,6 +400,26 @@ class DMRApp():
 
         return data.reset_index(drop=True)
 
+    # Функция возвращает статистическую информацию по радиосвязи за определенный месяц года
+    def _db_mysql_get_detail(self, rid: int, year: int, month: int) -> pandas.DataFrame:
+        self._db_check_connection(self._mysql)
+        days = monthrange(year, month)[1]
+        fweek = self._get_week(year, month, 1)
+        lweek = self._get_week(year, month, days)
+        fdm = datetime.datetime(year, month, 1, 0, 0, 0)
+        ldm = datetime.datetime(year, month, days, 23, 59, 59)
+
+        tmpl = f'rptbiz{str(year)}'
+        seltmpl = ''
+
+        for m in range(fweek, lweek + 1):
+            seltmpl += f'select senderid, starttime, duration, endtime from {tmpl}{m:02d} where (`starttime` between \'{fdm.strftime("%Y-%m-%d %H:%M:%S")}\' and \'{ldm.strftime("%Y-%m-%d %H:%M:%S")}\') and (`senderid` = {rid}) and `calltype`=1 union '
+        seltmpl = f'{seltmpl[0:-7]};'
+
+        data = pandas.DataFrame(self._mysql.execute(text(seltmpl)))
+        data.insert(1, 'sender', data['senderid'])
+        return data.reset_index(drop=True)
+
     #endregion
 
     #region Обработчики событий
@@ -354,7 +428,14 @@ class DMRApp():
         self._sdata = self.getstat(int(self._sl_year.value), self._month2num(self._sl_month.value))
         self._cont_t1.remove(self._tb_data)
         with self._cont_t1:
-           self._tb_data = ui.table.from_pandas(self._sdata).classes('w-full')
+            self._tb_data = ui.table.from_pandas(self._sdata).classes('w-full')
+            self._tb_data.add_slot('body-cell', r"""
+                <q-td :props="props" @dblclick="$parent.$emit('cell_dblclick', props)">
+                    {{ props.value }}
+                </q-td>
+                """)
+            self._tb_data.on('cell_dblclick', lambda msg: self.detail(msg.args.get('row')))
+        res = None
 
     # Изменение года
     def _change_year(self) -> None:
@@ -362,17 +443,41 @@ class DMRApp():
         self._sl_month.options = months
         self._sl_month.value = months[-1]
 
+    # Изменение группы
+    def _change_group(self) -> None:
+        res = self._sdata
+
+        if self._sl_group.value != 'Все группы':
+            res = res[res['Группа'] == self._sl_group.value]
+
+        self._cont_t1.remove(self._tb_data)
+        with self._cont_t1:
+            self._tb_data = ui.table.from_pandas(res).classes('w-full')
+            self._tb_data.add_slot('body-cell', r"""
+                <q-td :props="props" @dblclick="$parent.$emit('cell_dblclick', props)">
+                    {{ props.value }}
+                </q-td>
+                """)
+            self._tb_data.on('cell_dblclick', lambda msg: self.detail(msg.args.get('row')))
+        res = None
+
     # Загрузка статистики
     def _download_data(self) -> None:
         alph = list(map(chr, range(ord('A'), ord('Z')+1)))
         name = f'{str(self._sl_year.value)}-{self._sl_month.value}'
         fl = io.BytesIO()
         ew = pandas.ExcelWriter(fl)
-        self._sdata.to_excel(ew, sheet_name=name, index=False)
 
-        for column in self._sdata:
-            column_width = max(self._sdata[column].astype(str).map(len).max(), len(column)) + 3
-            col_idx = self._sdata.columns.get_loc(column)
+        res = self._sdata
+
+        if self._sl_group.value != 'Все группы':
+            res = res[res['Группа'] == self._sl_group.value]
+
+        res.to_excel(ew, sheet_name=name, index=False)
+
+        for column in res:
+            column_width = max(res[column].astype(str).map(len).max(), len(column)) + 3
+            col_idx = res.columns.get_loc(column)
             ew.sheets[name].column_dimensions[alph[col_idx]].width = column_width
         ew.close()
         fl.seek(0, 0)
@@ -413,39 +518,77 @@ class DMRApp():
         ui.download(fl.read(), f'{fname}.wav')
     #endregion
 
+    def detail(self, row: dict) -> None:
+        rid = row.get('ID радиостанции')
+        self._dialog.clear()
+        with  self._dialog, ui.card().style('width: 90%; height:90%; max-width: none;'):
+            with ui.row().classes('w-full items-end justify-end'):
+                ui.button('Закрыть', on_click=self.close_dlg)
+            with ui.scroll_area().classes('w-full h-full'):
+                ui.table.from_pandas(self.getdetail(int(rid), int(self._sl_year.value), self._month2num(self._sl_month.value))).classes('w-full')
+            self._dialog.open()
+
+    def close_dlg(self) -> None:
+        self._dialog.close()
+        self._dialog.clear()
+        with  self._dialog, ui.card().style('width: 90%; height:90%; max-width: none;'):
+            with ui.row().classes('w-full items-end justify-end'):
+                ui.button('Закрыть', on_click= self._dialog.close)
+
     #region Обработчики редиректов UI
     # Основная страница приложения
     def _uipg_main(self) -> None:
+        # Обновляем полномочия пользователя
+        self._role = self._users.get(app.storage.user.get('username')).get("role")
+
         # Готовим начальные данные
         years = self._db_mysql_get_years()
         months = self._db_mysql_get_months(years[-1], False)
+        groups = self._filter_groups(self._db_pgsql_get_group_names())
         self._sdata = self.getstat(years[-1], self._month2num(months[-1]))
 
         # Кнопка выхода
         with ui.row().classes('w-full items-end justify-end'):
-            ui.button(on_click=lambda: (app.storage.user.clear(), ui.navigate.to('/login')), icon='logout').classes('h-9')
+            ui.label(app.storage.user.get('username')).classes('h-8')
+            ui.button(on_click=lambda: (app.storage.user.clear(), ui.navigate.to('/login')), icon='logout').classes('h-6')
 
             # Панели
             with ui.tabs().classes('w-full') as self._tabs:
                 self._tab1 = ui.tab('Статистика')
-                self._tab2 = ui.tab('Звукозапись')
+                if self._role != "user":
+                    self._tab2 = ui.tab('Звукозапись')
 
         with ui.tab_panels(self._tabs, value=self._tab1).classes('w-full'):
             with ui.tab_panel(self._tab1):
                 self._cont_t1 = ui.row().classes('w-full items-end')
-            with ui.tab_panel(self._tab2):
-                self._cont_t2 = ui.row().classes('w-full items-end')
+            if self._role != "user":
+                with ui.tab_panel(self._tab2):
+                    self._cont_t2 = ui.row().classes('w-full items-end')
 
         with self._cont_t1:
             self._sl_month = ui.select(months, on_change=self._change_month, value=months[-1])
             self._sl_year = ui.select(years, on_change=self._change_year, value=years[-1])
+            self._sl_group = ui.select(groups, on_change=self._change_group, value=groups[-1])
             self._bt_download = ui.button('Скачать', on_click=self._download_data, icon='download')
             ui.separator()
             self._tb_data = ui.table.from_pandas(self._sdata).classes('w-full')
+            self._tb_data.add_slot('body-cell', r"""
+                <q-td :props="props" @dblclick="$parent.$emit('cell_dblclick', props)">
+                    {{ props.value }}
+                </q-td>
+                """)
+            self._tb_data.on('cell_dblclick', lambda msg: self.detail(msg.args.get('row')))
 
-        self._sl_month.classes('w-[30%] h-11 mx-auto')
-        self._sl_year.classes('w-[30%] h-11 mx-auto')
-        self._bt_download.classes('w-[30%] h-9 flex-auto')
+            with ui.dialog() as self._dialog, ui.card().classes('w-90'):
+                ui.button('Закрыть', on_click=self._dialog.close)
+
+        self._sl_month.classes('w-[23%] h-11 mx-auto')
+        self._sl_year.classes('w-[23%] h-11 mx-auto')
+        self._sl_group.classes('w-[23%] h-11 mx-auto')
+        self._bt_download.classes('w-[23%] h-9 flex-auto')
+
+        if self._role == "user":
+            return
 
         with self._cont_t2:
             self._in_date = ui.input('Дата', value=self._today(), on_change=self._change_date)
@@ -472,8 +615,9 @@ class DMRApp():
     # Страница входа
     def _uipg_login(self) -> Optional[RedirectResponse]:
         def try_login() -> None:
-            if self._users.get(username.value) == password.value:
+            if self._users.get(username.value).get("pass") == password.value:
                 app.storage.user.update({'username': username.value, 'authenticated': True})
+                self._role = self._users.get(username.value).get("role")
                 ui.navigate.to(app.storage.user.get('referrer_path', '/'))
             else:
                 ui.notify('Неверное имя пользователя или пароль', color='negative')
