@@ -1,0 +1,18 @@
+{
+    "dbpass": "dbpass",
+    "recdir": "D:\\RadioRecord",
+    "users": {
+        "dmruser": {
+               "pass": "userpass",
+               "role": "user"
+               },
+        "dmrmanager": {
+               "pass": "managerpass",
+               "role": "manager"
+               },
+        "admin": {
+               "pass": "adminpass",
+               "role": "admin"
+               }
+    }
+}
